@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Work-Life Boundary · 工作与生活边界</title>
+    <!-- TensorFlow.js + BodyPix for human segmentation -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
+    <style>
+        /* ===== 全局重置 & 全屏样式 ===== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            font-family: Arial, Helvetica, sans-serif;
+            background: #f0f0f0;
+        }
+
+        /* ===== 主画布：文字下落层 ===== */
+        #mainCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        /* ===== 摄像头画面（全屏可见） ===== */
+        #video {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 1;
+            opacity: 1.0;
+            transform: scaleX(-1);
+        }
+
+        /* ===== 人体掩码 canvas（完全透明，仅用于碰撞检测） ===== */
+        #maskCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            opacity: 0.0;
+            pointer-events: none;
+        }
+
+        /* ===== 红色提示框 ===== */
+        #alertBox {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 100;
+            background-color: #d32f2f;
+            color: #ffffff;
+            font-size: 2.2rem;
+            font-weight: bold;
+            padding: 32px 48px;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            text-align: center;
+            display: none;
+            pointer-events: none;
+            letter-spacing: 1px;
+            line-height: 1.4;
+            max-width: 80%;
+        }
+        #alertBox.show {
+            display: block;
+        }
+
+        /* ===== 摄像头权限被拒时的提示 ===== */
+        #cameraDenied {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 200;
+            background: #fff;
+            border: 2px solid #d32f2f;
+            padding: 40px 50px;
+            border-radius: 16px;
+            text-align: center;
+            font-size: 1.2rem;
+            color: #333;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            display: none;
+            max-width: 500px;
+            line-height: 1.6;
+        }
+        #cameraDenied h2 {
+            color: #d32f2f;
+            margin-bottom: 12px;
+        }
+
+        /* ===== 加载提示 ===== */
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 300;
+            font-size: 1.4rem;
+            color: #555;
+            text-align: center;
+        }
+        #loading .spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #ddd;
+            border-top-color: #d32f2f;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-bottom: 16px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 加载提示 -->
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>Loading camera & model...</div>
+    </div>
+
+    <!-- 摄像头画面 -->
+    <video id="video" autoplay playsinline></video>
+
+    <!-- 人体掩码 canvas（不可见，仅用于像素级碰撞检测） -->
+    <canvas id="maskCanvas"></canvas>
+
+    <!-- 主画布：文字下落 -->
+    <canvas id="mainCanvas"></canvas>
+
+    <!-- 红色提示框 -->
+    <div id="alertBox">Continue working</div>
+
+    <!-- 摄像头被拒提示 -->
+    <div id="cameraDenied">
+        <h2>📷 Camera Access Denied</h2>
+        <p>This experience requires camera access for body detection.<br>
+        Please allow camera access and refresh the page.</p>
+    </div>
+
+    <script>
+        // ================================================================
+        //  全局配置
+        // ================================================================
+        const CONFIG = {
+            fallSpeedPercent: 0.10,        // 文字下落速度：每秒屏幕高度的10%
+            startDelay: 3000,               // 初始延迟3秒
+            minWords: 80,                   // 最少文字数
+            maxWords: 150,                  // 最多文字数
+            stillnessThreshold: 20,         // 静止检测阈值（像素）
+            stillnessTime: 8000,            // 静止触发时间8秒
+            alertDuration: 3000,            // 提示框显示3秒
+            segmentationConfig: {           // BodyPix最高精度配置
+                flipHorizontal: true,
+                internalResolution: 'full',
+                segmentationThreshold: 0.4,
+                maxDetections: 1,
+                scoreThreshold: 0.2,
+                nmsRadius: 20,
+            }
+        };
+
+        // ================================================================
+        //  词库（中英文混合职场话语）
+        // ================================================================
+        const WORD_POOL = [
+            '老板', 'Boss', '进度呢', 'Progress?', '回复一下', 'Reply pls',
+            '确认收到', 'Confirm', '今晚加班', 'Overtime tonight',
+            '马上处理', 'Do it now', '消息弹窗', 'Ping',
+            '需求变更', 'Requirement changed', '还在吗', 'Are you there?',
+            '周末能上线吗', 'Weekend launch?', '方案呢', "Where's the plan?",
+            '尽快', 'ASAP', '收到', 'Copy that', '好的', 'OK',
+            '正在做', 'Working on it', '需要时间', 'Need time',
+            '报告呢', 'Report?', '今天必须', 'Due today',
+            '客户在催', 'Client chasing', '改一下', 'Revise',
+            '紧急', 'Urgent', '会议提前', 'Meeting moved up',
+            '文档呢', 'Docs?', '确认一下', 'Double check',
+            '辛苦了', 'Good work', '再改一版', 'One more revision',
+            'Deadline', '截止时间', '跟进', 'Follow up',
+            '同步一下', 'Sync up', '有bug', 'Bug found',
+            '线上问题', 'Production issue', '回消息', 'Reply now',
+        ];
+
+        // ================================================================
+        //  DOM 引用
+        // ================================================================
+        const video = document.getElementById('video');
+        const maskCanvas = document.getElementById('maskCanvas');
+        const mainCanvas = document.getElementById('mainCanvas');
+        const ctx = mainCanvas.getContext('2d');
+        const maskCtx = maskCanvas.getContext('2d');
+        const alertBox = document.getElementById('alertBox');
+        const loadingEl = document.getElementById('loading');
+        const cameraDeniedEl = document.getElementById('cameraDenied');
+
+        // ================================================================
+        //  办公消息提示音系统（Web Audio API 合成）
+        // ================================================================
+        let audioCtx = null;
+        let soundInterval = null;
+
+        function initAudio() {
+            if (audioCtx) return;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                playOfficeSounds();
+            } catch (e) { console.warn('Audio not available:', e); }
+        }
+
+        function playNotificationSound() {
+            if (!audioCtx) return;
+            try {
+                const now = audioCtx.currentTime;
+                const type = Math.floor(Math.random() * 4);
+                if (type === 0) {
+                    const o1 = audioCtx.createOscillator(), g1 = audioCtx.createGain();
+                    o1.type = 'sine'; o1.frequency.setValueAtTime(880, now); o1.frequency.setValueAtTime(1100, now + 0.06);
+                    g1.gain.setValueAtTime(0.15, now); g1.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+                    o1.connect(g1); g1.connect(audioCtx.destination); o1.start(now); o1.stop(now + 0.2);
+                    const o2 = audioCtx.createOscillator(), g2 = audioCtx.createGain();
+                    o2.type = 'sine'; o2.frequency.setValueAtTime(1320, now + 0.15);
+                    g2.gain.setValueAtTime(0.12, now + 0.15); g2.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+                    o2.connect(g2); g2.connect(audioCtx.destination); o2.start(now + 0.15); o2.stop(now + 0.4);
+                } else if (type === 1) {
+                    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+                    o.type = 'triangle'; o.frequency.setValueAtTime(600 + Math.random() * 200, now);
+                    g.gain.setValueAtTime(0.12, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+                    o.connect(g); g.connect(audioCtx.destination); o.start(now); o.stop(now + 0.15);
+                } else if (type === 2) {
+                    const o1 = audioCtx.createOscillator(), g1 = audioCtx.createGain();
+                    o1.type = 'sine'; o1.frequency.setValueAtTime(523, now);
+                    g1.gain.setValueAtTime(0.15, now); g1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+                    o1.connect(g1); g1.connect(audioCtx.destination); o1.start(now); o1.stop(now + 0.12);
+                    const o2 = audioCtx.createOscillator(), g2 = audioCtx.createGain();
+                    o2.type = 'sine'; o2.frequency.setValueAtTime(659, now + 0.1);
+                    g2.gain.setValueAtTime(0.15, now + 0.1); g2.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+                    o2.connect(g2); g2.connect(audioCtx.destination); o2.start(now + 0.1); o2.stop(now + 0.25);
+                } else {
+                    [523, 659, 784].forEach((f, i) => {
+                        const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+                        o.type = 'sine'; o.frequency.setValueAtTime(f, now + i * 0.05);
+                        g.gain.setValueAtTime(0.08, now + i * 0.05); g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.05 + 0.2);
+                        o.connect(g); g.connect(audioCtx.destination); o.start(now + i * 0.05); o.stop(now + i * 0.05 + 0.2);
+                    });
+                }
+            } catch (e) {}
+        }
+
+        function playOfficeSounds() {
+            if (soundInterval) clearInterval(soundInterval);
+            const s = () => { if (!audioCtx) return; playNotificationSound(); soundInterval = setTimeout(s, 2000 + Math.random() * 3000); };
+            soundInterval = setTimeout(s, 1000);
+        }
+
+        function stopSounds() { if (soundInterval) { clearTimeout(soundInterval); soundInterval = null; } }
+
+        // ================================================================
+        //  状态变量
+        // ================================================================
+        let bodyPixModel = null, segmentation = null, words = [];
+        let animFrameId = null, lastTimestamp = 0, isRunning = false;
+        let keypointsHistory = [], stillnessStartTime = null, isAlertShowing = false, alertTimer = null;
+        let wordSpawnTimer = 0, segLoopId = null;
+
+        // ================================================================
+        //  工具函数
+        // ================================================================
+        function getRandomWord() { return WORD_POOL[Math.floor(Math.random() * WORD_POOL.length)]; }
+        function getRandomWorkColor() { return ['#8B0000','#A52A2A','#B22222','#4A4A4A','#5C4033','#6B3A3A','#3E3E3E','#7B2D2D'][Math.floor(Math.random() * 8)]; }
+        function getRandomFontSize() { return 14 + Math.floor(Math.random() * 15); }
+        function getRandomFontWeight() { return Math.random() > 0.5 ? 'bold' : '600'; }
+
+        // ================================================================
+        //  Word 类：下落文字（像 Text Rain 一样分布全屏）
+        // ================================================================
+        class FallingWord {
+            constructor(spreadFullScreen) {
+                this.text = getRandomWord();
+                this.fontSize = getRandomFontSize();
+                this.fontWeight = getRandomFontWeight();
+                this.color = getRandomWorkColor();
+                this.font = `${this.fontWeight} ${this.fontSize}px Arial, Helvetica, sans-serif`;
+                ctx.font = this.font;
+                this.width = ctx.measureText(this.text).width + 10;
+                this.height = this.fontSize * 1.4;
+                const maxX = Math.max(mainCanvas.width - this.width - 10, 10);
+                this.x = 5 + Math.random() * maxX;
+                this.y = spreadFullScreen ? Math.random() * (mainCanvas.height + 50) - 25 : -this.height - Math.random() * 150;
+                this.speed = mainCanvas.height * CONFIG.fallSpeedPercent;
+                this.blocked = false;
+                this.dead = false;
+            }
+            update(deltaSec) {
+                if (this.dead) return;
+                if (!this.blocked) this.y += this.speed * deltaSec;
+                if (this.y > mainCanvas.height + 30) this.dead = true;
+            }
+            draw(ctx) {
+                if (this.dead) return;
+                ctx.save();
+                ctx.font = this.font;
+                ctx.fillStyle = this.color;
+                ctx.textBaseline = 'top';
+                ctx.globalAlpha = this.blocked ? 0.12 : 0.90;
+                ctx.fillText(this.text, this.x, this.y);
+                ctx.restore();
+            }
+            getBounds() { return { x: this.x, y: this.y, w: this.width, h: this.height }; }
+        }
+
+        // ================================================================
+        //  碰撞检测：文字 vs 人体掩码（边缘贴合）
+        //  关键：CSS scaleX(-1) 镜像显示，但 BodyPix 数据基于原始帧，
+        //  所以 canvas x 需水平翻转后再映射到掩码坐标。
+        // ================================================================
+        function isWordBlockedByBody(word, maskData, maskWidth, maskHeight) {
+            if (!segmentation || !maskData) return false;
+            const bounds = word.getBounds();
+            const scaleX = maskWidth / mainCanvas.width;
+            const scaleY = maskHeight / mainCanvas.height;
+            const steps = 5;
+            let hitCount = 0, totalSamples = 0;
+            for (let i = 0; i < steps; i++) {
+                for (let j = 0; j < steps; j++) {
+                    const sx = bounds.x + (bounds.w * (i + 0.5) / steps);
+                    const sy = bounds.y + (bounds.h * (j + 0.5) / steps);
+                    const flippedX = mainCanvas.width - sx; // 水平翻转补偿镜像
+                    const mx = Math.floor(flippedX * scaleX);
+                    const my = Math.floor(sy * scaleY);
+                    if (mx >= 0 && mx < maskWidth && my >= 0 && my < maskHeight) {
+                        if (maskData[my * maskWidth + mx] === 1) hitCount++;
+                        totalSamples++;
+                    }
+                }
+            }
+            return totalSamples > 0 && (hitCount / totalSamples) > 0.08;
+        }
+
+        // ================================================================
+        //  静止检测（基于人体重心）
+        // ================================================================
+        function computeBodyCenter(maskData, maskWidth, maskHeight) {
+            let tx = 0, ty = 0, c = 0;
+            for (let y = 0; y < maskHeight; y++) {
+                for (let x = 0; x < maskWidth; x++) {
+                    if (maskData[y * maskWidth + x] === 1) { tx += x; ty += y; c++; }
+                }
+            }
+            return c === 0 ? null : { x: tx / c, y: ty / c };
+        }
+
+        function checkStillness(center, history) {
+            if (!center || history.length < 5) return false;
+            const recent = history.slice(-5);
+            const ax = recent.reduce((s, p) => s + p.x, 0) / recent.length;
+            const ay = recent.reduce((s, p) => s + p.y, 0) / recent.length;
+            return Math.hypot(center.x - ax, center.y - ay) < CONFIG.stillnessThreshold;
+        }
+
+        // ================================================================
+        //  提示框管理
+        // ================================================================
+        function showAlert() {
+            if (isAlertShowing) return;
+            isAlertShowing = true;
+            alertBox.classList.add('show');
+            if (alertTimer) clearTimeout(alertTimer);
+            alertTimer = setTimeout(() => {
+                alertBox.classList.remove('show');
+                isAlertShowing = false;
+                alertTimer = null;
+            }, CONFIG.alertDuration);
+        }
+
+        // ================================================================
+        //  文字生成与管理
+        // ================================================================
+        function manageWordCount() {
+            words = words.filter(w => !w.dead);
+            const target = CONFIG.minWords + Math.floor(Math.random() * (CONFIG.maxWords - CONFIG.minWords));
+            while (words.length < target && words.length < CONFIG.maxWords) words.push(new FallingWord());
+            while (words.length > CONFIG.maxWords) { words.shift().dead = true; }
+        }
+
+        function spawnNewWords() {
+            const n = 1 + Math.floor(Math.random() * 3);
+            for (let i = 0; i < n; i++) { if (words.length < CONFIG.maxWords) words.push(new FallingWord()); }
+        }
+
+        // ================================================================
+        //  人体分割独立循环（~15fps，不阻塞渲染）
+        // ================================================================
+        async function segmentationLoop() {
+            if (!isRunning) return;
+            try {
+                if (bodyPixModel && video.readyState >= 2) {
+                    segmentation = await bodyPixModel.segmentPerson(video, CONFIG.segmentationConfig);
+                }
+            } catch (e) {}
+            segLoopId = setTimeout(segmentationLoop, 66);
+        }
+
+        // ================================================================
+        //  主渲染循环（纯同步，60fps）
+        // ================================================================
+        function mainLoop(timestamp) {
+            if (!isRunning) return;
+            if (lastTimestamp === 0) lastTimestamp = timestamp;
+            const deltaMs = Math.min(timestamp - lastTimestamp, 100);
+            const deltaSec = deltaMs / 1000;
+            lastTimestamp = timestamp;
+
+            // 1. 获取掩码数据
+            let md = null, mw = 0, mh = 0;
+            if (segmentation && segmentation.data) { md = segmentation.data; mw = segmentation.width; mh = segmentation.height; }
+
+            // 2. 碰撞检测
+            for (const w of words) {
+                if (w.dead) continue;
+                w.blocked = md ? isWordBlockedByBody(w, md, mw, mh) : false;
+            }
+
+            // 3. 更新位置
+            for (const w of words) w.update(deltaSec);
+
+            // 4. 管理文字
+            manageWordCount();
+            wordSpawnTimer += deltaMs;
+            if (wordSpawnTimer > 800) { spawnNewWords(); wordSpawnTimer = 0; }
+
+            // 5. 静止检测
+            if (md) {
+                const center = computeBodyCenter(md, mw, mh);
+                if (center) {
+                    keypointsHistory.push(center);
+                    if (keypointsHistory.length > 200) keypointsHistory.shift();
+                    if (checkStillness(center, keypointsHistory)) {
+                        if (stillnessStartTime === null) stillnessStartTime = performance.now();
+                        else if (performance.now() - stillnessStartTime >= CONFIG.stillnessTime && !isAlertShowing) {
+                            showAlert();
+                            stillnessStartTime = null;
+                            keypointsHistory = [];
+                        }
+                    } else stillnessStartTime = null;
+                } else stillnessStartTime = null;
+            } else { stillnessStartTime = null; keypointsHistory = []; }
+
+            // 6. 绘制
+            ctx.clearRect(0, 0, mainCanvas.width, mainCanvas.height);
+            for (const w of words) w.draw(ctx);
+
+            animFrameId = requestAnimationFrame(mainLoop);
+        }
+
+        // ================================================================
+        //  窗口自适应
+        // ================================================================
+        function resizeCanvas() {
+            const w = window.innerWidth, h = window.innerHeight;
+            mainCanvas.width = w; mainCanvas.height = h;
+            maskCanvas.width = w; maskCanvas.height = h;
+            for (const word of words) word.speed = h * CONFIG.fallSpeedPercent;
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        // ================================================================
+        //  初始化
+        // ================================================================
+        async function initCamera() {
+            try {
+                const s = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false });
+                video.srcObject = s; await video.play(); return true;
+            } catch (e) { return false; }
+        }
+
+        async function initBodyPix() {
+            try { bodyPixModel = await bodyPix.load({ architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2 }); return true; }
+            catch (e) { return false; }
+        }
+
+        async function start() {
+            if (!await initCamera()) { loadingEl.style.display = 'none'; cameraDeniedEl.style.display = 'block'; return; }
+            if (!await initBodyPix()) { loadingEl.textContent = 'Failed to load model. Please refresh.'; return; }
+            resizeCanvas();
+            loadingEl.style.display = 'none';
+
+            const startAudio = () => { initAudio(); document.removeEventListener('click', startAudio); document.removeEventListener('touchstart', startAudio); document.removeEventListener('keydown', startAudio); };
+            document.addEventListener('click', startAudio); document.addEventListener('touchstart', startAudio); document.addEventListener('keydown', startAudio);
+            initAudio();
+
+            setTimeout(() => {
+                isRunning = true; lastTimestamp = 0; wordSpawnTimer = 0;
+                for (let i = 0; i < CONFIG.minWords; i++) words.push(new FallingWord(true));
+                segmentationLoop();
+                animFrameId = requestAnimationFrame(mainLoop);
+            }, CONFIG.startDelay);
+        }
+
+        window.addEventListener('load', start);
+        window.addEventListener('beforeunload', function() {
+            isRunning = false;
+            if (animFrameId) cancelAnimationFrame(animFrameId);
+            if (segLoopId) clearTimeout(segLoopId);
+            if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+            if (alertTimer) clearTimeout(alertTimer);
+            stopSounds();
+            if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+        });
+
+        console.log('Work-Life Boundary · 工作与生活边界');
+        console.log('Move your body to block falling work messages!');
+        console.log('Stay still for 8 seconds to trigger the alert.');
+    </script>
+</body>
+</html>
